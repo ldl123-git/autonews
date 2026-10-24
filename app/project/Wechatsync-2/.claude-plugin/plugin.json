@@ -1,0 +1,14 @@
+{
+  "name": "sync",
+  "version": "1.0.0",
+  "description": "Sync articles to 20+ content platforms (Zhihu, Juejin, CSDN, Toutiao, Weibo, etc.)",
+  "author": {
+    "name": "fun",
+    "url": "https://github.com/wechatsync"
+  },
+  "homepage": "https://www.wechatsync.com",
+  "repository": "https://github.com/wechatsync/Wechatsync",
+  "license": "MIT",
+  "keywords": ["sync", "article", "blog", "zhihu", "juejin", "csdn", "weibo", "content"],
+  "skills": ["./skills/"]
+}

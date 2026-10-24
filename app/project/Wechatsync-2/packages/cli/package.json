@@ -1,0 +1,50 @@
+{
+  "name": "@wechatsync/cli",
+  "version": "1.1.0",
+  "description": "WechatSync CLI - 命令行同步文章到多个平台",
+  "main": "dist/index.js",
+  "bin": {
+    "wechatsync": "./dist/index.js"
+  },
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "build": "tsup",
+    "dev": "tsup --watch",
+    "start": "node dist/index.js"
+  },
+  "keywords": [
+    "wechat",
+    "sync",
+    "markdown",
+    "zhihu",
+    "juejin",
+    "csdn",
+    "publish",
+    "article",
+    "claude",
+    "ai"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/wechatsync/Wechatsync"
+  },
+  "author": "fun",
+  "license": "MIT",
+  "dependencies": {
+    "chalk": "^5.3.0",
+    "commander": "^12.1.0",
+    "juice": "^11.1.1",
+    "open": "^10.1.0",
+    "ora": "^8.0.1",
+    "ws": "^8.18.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.2",
+    "@types/ws": "^8.5.13",
+    "@wechatsync/mcp-server": "workspace:*",
+    "tsup": "^8.5.1",
+    "typescript": "^5.7.2"
+  }
+}

@@ -1,0 +1,19 @@
+{
+  "name": "wechatsync",
+  "owner": {
+    "name": "wechatsync",
+    "url": "https://github.com/wechatsync"
+  },
+  "plugins": [
+    {
+      "name": "sync",
+      "source": "./",
+      "version": "1.0.0",
+      "description": "Sync articles to 20+ content platforms (Zhihu, Juejin, CSDN, Toutiao, Weibo, etc.)",
+      "author": {
+        "name": "fun",
+        "url": "https://github.com/lljxx1"
+      }
+    }
+  ]
+}

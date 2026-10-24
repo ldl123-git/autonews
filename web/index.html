@@ -1,0 +1,342 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>热点资讯采集台</title>
+<link rel="stylesheet" href="/static/styles.css" />
+</head>
+<body>
+<header class="topbar">
+  <div class="brand">
+    <span class="logo">快</span>
+    <div>
+      <h1>热点资讯采集台</h1>
+      <p class="sub">表格解析 · 原文抓取 · 临时缓存区</p>
+    </div>
+  </div>
+  <nav class="tabs">
+    <button class="tab active" data-view="news">热点资讯</button>
+    <button class="tab" data-view="pipeline">生产流水线</button>
+    <button class="tab" data-view="publish">发布中心</button>
+    <button class="tab" data-view="accounts">账号中心</button>
+    <button class="tab" data-view="cache">抓取缓存区 <span id="cache-badge" class="badge">0</span></button>
+    <button class="tab" data-view="settings">系统维护</button>
+  </nav>
+  <button id="auto-refresh" class="auto-toggle" title="开启后每 4 秒自动刷新当前页的数据">自动刷新：开</button>
+</header>
+
+<main>
+  <!-- ======================= 资讯视图 ======================= -->
+  <section id="view-news" class="view active">
+    <div class="upload-zone" id="dropzone">
+      <input type="file" id="file-input" multiple accept=".xlsx,.xls,.csv" hidden />
+      <div class="upload-inner">
+        <div class="upload-icon">⬆</div>
+        <div class="upload-title">点击或拖拽上传热点表格</div>
+        <div class="upload-hint">支持 .xlsx / .xls / .csv，不限文件大小与数量，可同时选择多个文件</div>
+      </div>
+      <div id="batch-list" class="batch-list"></div>
+    </div>
+
+    <div class="stat-cards" id="stat-cards"></div>
+
+    <div class="toolbar">
+      <input id="q" class="input" type="search" placeholder="搜索标题 / 来源 / 作者 / 链接" />
+      <select id="status" class="input">
+        <option value="">全部状态</option>
+        <option value="pending">未抓取</option>
+        <option value="fetching">抓取中</option>
+        <option value="success">抓取成功</option>
+        <option value="failed">抓取失败</option>
+      </select>
+      <select id="category" class="input"><option value="">全部分类</option></select>
+      <select id="sort" class="input">
+        <option value="default">默认排序（阅读↓ 时间↓）</option>
+        <option value="read">按阅读量</option>
+        <option value="like">按点赞量</option>
+        <option value="time">按发布时间</option>
+      </select>
+      <label class="chk"><input type="checkbox" id="only-cached" /> 仅已抓取</label>
+      <div class="grow"></div>
+      <span id="queue-info" class="queue-info"></span>
+      <button id="btn-fetch-all" class="btn primary">抓取全部未抓取</button>
+      <button id="btn-rewrite-all" class="btn accent">改写已抓取</button>
+      <button id="btn-export-all" class="btn">导出已抓取</button>
+      <button id="btn-media-all" class="btn accent">收集素材</button>
+      <button id="btn-clear-queue" class="btn ghost">清空队列</button>
+    </div>
+
+    <datalist id="cat-list"></datalist>
+    <div id="groups" class="groups"></div>
+    <div id="empty" class="empty hidden">暂无数据，先上传一个表格吧</div>
+  </section>
+
+  <!-- ======================= 生产流水线视图 ======================= -->
+  <section id="view-pipeline" class="view">
+    <div class="toolbar compact">
+      <span id="pipeline-hint" class="queue-info">按阶段看进度，卡在哪一眼能看到</span>
+      <div class="grow"></div>
+      <button id="btn-pipeline-refresh" class="btn ghost">刷新</button>
+      <button id="btn-pipeline-clean" class="btn danger">清理已交付</button>
+      <button id="btn-pipeline-run" class="btn primary">一键跑全链路</button>
+    </div>
+    <div id="pipeline-stats" class="publish-stats"></div>
+    <div id="pipeline-board" class="pipeline-board"></div>
+  </section>
+
+  <!-- ======================= 发布中心视图 ======================= -->
+  <section id="view-publish" class="view">
+    <div class="toolbar compact">
+      <select id="pub-filter-status" class="input">
+        <option value="">全部状态</option>
+        <option value="success">成功</option>
+        <option value="failed">失败</option>
+        <option value="running">进行中</option>
+      </select>
+      <select id="pub-filter-account" class="input"><option value="">全部账号</option></select>
+      <span id="publish-hint" class="queue-info"></span>
+      <div class="grow"></div>
+      <button id="btn-pub-refresh" class="btn ghost">刷新</button>
+    </div>
+    <div id="publish-stats" class="publish-stats"></div>
+    <div id="publish-center"></div>
+  </section>
+
+  <!-- ======================= 缓存区视图 ======================= -->
+  <section id="view-cache" class="view">
+    <div class="cache-head">
+      <div class="stat-cards" id="cache-stats"></div>
+      <div class="toolbar compact">
+        <div class="segmented" id="cache-type">
+          <button class="seg active" data-type="">全部</button>
+          <button class="seg" data-type="文章">文章</button>
+          <button class="seg" data-type="图片">图片</button>
+          <button class="seg" data-type="视频">视频</button>
+        </div>
+        <input id="cache-q" class="input" type="search" placeholder="搜索标题 / 摘要 / 链接" />
+        <div class="grow"></div>
+        <button id="btn-clear-cache" class="btn danger">清空缓存区</button>
+      </div>
+    </div>
+    <div id="cache-list" class="cache-list"></div>
+    <div id="cache-empty" class="empty hidden">缓存区为空，先去抓取一些原文</div>
+    <div id="cache-more" class="more hidden"><button class="btn ghost" id="btn-cache-more">加载更多</button></div>
+  </section>
+
+  <!-- ======================= 系统设置视图 ======================= -->
+  <section id="view-settings" class="view">
+    <div class="toolbar compact">
+      <div class="segmented" id="settings-sub">
+        <button class="seg active" data-sub="llm">大模型配置</button>
+        <button class="seg" data-sub="runtime">运行环境</button>
+        <button class="seg" data-sub="cleanup">数据清理</button>
+      </div>
+      <div class="grow"></div>
+      <span id="settings-hint" class="queue-info"></span>
+      <button id="btn-llm-add" class="btn primary">+ 新增大模型</button>
+      <button id="btn-settings-save" class="btn primary hidden">保存全部</button>
+      <button id="btn-settings-reset" class="btn ghost hidden">恢复默认</button>
+    </div>
+
+    <!-- 大模型 -->
+    <div id="panel-llm">
+      <div class="sub-head">
+        <div class="segmented" id="llm-cat">
+          <button class="seg active" data-cat="article">文章大模型</button>
+          <button class="seg" data-cat="video">视频大模型</button>
+        </div>
+        <span id="llm-cat-desc" class="queue-info"></span>
+      </div>
+      <div id="llm-list" class="cfg-list"></div>
+      <div id="llm-empty" class="empty hidden">该分类下还没有配置，点右上角「新增大模型」接入一个 API</div>
+    </div>
+
+    <!-- 运行环境 -->
+    <div id="panel-runtime" class="hidden">
+      <div id="settings-groups" class="cfg-groups"></div>
+    </div>
+
+    <!-- 数据清理 -->
+    <div id="panel-cleanup" class="hidden">
+      <div class="toolbar compact">
+        <span id="cleanup-hint" class="queue-info">先扫描，确认占用再清理</span>
+        <div class="grow"></div>
+        <button id="btn-cleanup-scan" class="btn primary">扫描占用</button>
+        <button id="btn-cleanup-vacuum" class="btn ghost">数据库收缩</button>
+      </div>
+      <div id="cleanup-body" class="cfg-groups"></div>
+    </div>
+  </section>
+
+  <!-- ======================= 账号管理视图 ======================= -->
+  <section id="view-accounts" class="view">
+    <div class="toolbar compact">
+      <div class="segmented" id="acc-platform"></div>
+      <div class="grow"></div>
+      <span id="acc-hint" class="queue-info"></span>
+      <button id="btn-acc-add" class="btn primary">+ 新增账号</button>
+    </div>
+    <div id="acc-list" class="cfg-list"></div>
+    <div id="acc-empty" class="empty hidden">这个分类下还没有账号，点右上角「新增账号」添加</div>
+  </section>
+</main>
+
+<!-- 抽屉 -->
+<div id="drawer-mask" class="drawer-mask hidden"></div>
+<aside id="drawer" class="drawer hidden">
+  <div class="drawer-head">
+    <h3 id="drawer-title">原文内容</h3>
+    <button id="drawer-close" class="btn ghost">关闭</button>
+  </div>
+  <div id="drawer-body" class="drawer-body"></div>
+</aside>
+
+<!-- 账号配置弹窗 -->
+<div id="acc-modal-mask" class="modal-mask hidden"></div>
+<div id="acc-modal" class="modal hidden">
+  <div class="modal-head">
+    <h3 id="acc-modal-title">新增账号</h3>
+    <button id="acc-modal-close" class="btn ghost">关闭</button>
+  </div>
+  <div class="modal-body">
+    <div class="form-grid">
+      <div class="field">
+        <label>账号名称 <em>*</em></label>
+        <input id="a-name" class="input" type="text" placeholder="如：头条主号" />
+      </div>
+      <div class="field">
+        <label>平台分类 <em>*</em></label>
+        <select id="a-platform" class="input"></select>
+      </div>
+      <div class="field">
+        <label>登录用户名</label>
+        <input id="a-login_user" class="input" type="text" placeholder="手机号 / 邮箱，仅备注用" />
+      </div>
+      <div class="field">
+        <label>后台首页</label>
+        <input id="a-home_url" class="input" type="text" placeholder="刷新 cookie 时打开的地址" />
+      </div>
+      <div class="field span2">
+        <label>浏览器用户数据目录</label>
+        <input id="a-profile_dir" class="input" type="text" placeholder="留空自动生成，不用填" />
+        <div class="field-hint">必须落在 WSL 本地，<b>不能填 E:\ 这类 Windows 路径</b>——NTFS 挂载盘上 chromium 出不了锁；填了会自动改正</div>
+      </div>
+      <div class="field span2">
+        <label>浏览器可执行文件</label>
+        <input id="a-executable_path" class="input" type="text" placeholder="留空则用「系统设置 → 浏览器」里的配置" />
+      </div>
+      <div class="field">
+        <label>代理</label>
+        <input id="a-proxy" class="input" type="text" placeholder="如 http://127.0.0.1:7890，可留空" />
+      </div>
+      <div class="field">
+        <label>自动续期间隔（小时）</label>
+        <input id="a-refresh_hours" class="input" type="number" min="1" step="1" />
+      </div>
+      <div class="field">
+        <label>开关</label>
+        <div class="chk"><input type="checkbox" id="a-enabled" checked /> <span>启用</span></div>
+        <div class="chk"><input type="checkbox" id="a-headless" /> <span>刷新时用无头浏览器</span></div>
+        <div class="chk"><input type="checkbox" id="a-auto_refresh" /> <span>临近过期时自动续期</span></div>
+      </div>
+      <div class="field span2">
+        <label>备注</label>
+        <input id="a-note" class="input" type="text" />
+      </div>
+    </div>
+    <div id="acc-modal-msg" class="drawer-note hidden"></div>
+  </div>
+  <div class="modal-foot">
+    <button id="acc-modal-test" class="btn">打开浏览器登录</button>
+    <div class="grow"></div>
+    <button id="acc-modal-cancel" class="btn ghost">取消</button>
+    <button id="acc-modal-save" class="btn primary">保存</button>
+  </div>
+</div>
+
+<!-- 大模型配置弹窗 -->
+<div id="modal-mask" class="modal-mask hidden"></div>
+<div id="modal" class="modal hidden">
+  <div class="modal-head">
+    <h3 id="modal-title">新增大模型</h3>
+    <button id="modal-close" class="btn ghost">关闭</button>
+  </div>
+  <div class="modal-body">
+    <div class="form-grid">
+      <div class="field span2">
+        <label>配置名称 <em>*</em></label>
+        <input id="f-name" class="input" type="text" placeholder="如 DeepSeek V3（文章）" />
+      </div>
+      <div class="field">
+        <label>用途分类 <em>*</em></label>
+        <select id="f-category" class="input"></select>
+      </div>
+      <div class="field">
+        <label>服务商</label>
+        <select id="f-provider" class="input"></select>
+      </div>
+      <div class="field span2">
+        <label>接口地址（Base URL）</label>
+        <input id="f-base_url" class="input" type="text" placeholder="https://api.deepseek.com/v1" />
+      </div>
+      <div class="field">
+        <label>请求协议</label>
+        <select id="f-api_style" class="input"></select>
+      </div>
+      <div class="field">
+        <label>模型名</label>
+        <input id="f-model" class="input" type="text" list="f-model-list" placeholder="deepseek-chat" />
+        <datalist id="f-model-list"></datalist>
+      </div>
+      <div class="field span2">
+        <label>API Key</label>
+        <input id="f-api_key" class="input" type="password" autocomplete="off" placeholder="留空表示不修改已保存的 Key" />
+      </div>
+      <div class="field">
+        <label>温度 temperature</label>
+        <input id="f-temperature" class="input" type="number" step="0.1" min="0" max="2" />
+      </div>
+      <div class="field">
+        <label>top_p</label>
+        <input id="f-top_p" class="input" type="number" step="0.05" min="0" max="1" />
+      </div>
+      <div class="field">
+        <label>最大输出 max_tokens</label>
+        <input id="f-max_tokens" class="input" type="number" step="256" min="1" />
+      </div>
+      <div class="field">
+        <label>超时（秒）</label>
+        <input id="f-timeout" class="input" type="number" step="5" min="5" />
+      </div>
+      <div class="field">
+        <label>优先级</label>
+        <input id="f-priority" class="input" type="number" step="1" />
+      </div>
+      <div class="field">
+        <label>状态</label>
+        <div class="chk"><input type="checkbox" id="f-enabled" checked /> <span>启用</span></div>
+        <div class="chk"><input type="checkbox" id="f-is_default" /> <span>设为该分类默认</span></div>
+      </div>
+      <div class="field span2">
+        <label>系统提示词</label>
+        <textarea id="f-system_prompt" class="input" rows="3" placeholder="可留空，在改写模块里按任务拼装提示词"></textarea>
+      </div>
+      <div class="field span2">
+        <label>备注</label>
+        <input id="f-note" class="input" type="text" placeholder="如：按量计费、限速 3 次/秒" />
+      </div>
+    </div>
+    <div id="modal-msg" class="drawer-note hidden"></div>
+  </div>
+  <div class="modal-foot">
+    <button id="modal-test" class="btn">测试连接</button>
+    <div class="grow"></div>
+    <button id="modal-cancel" class="btn ghost">取消</button>
+    <button id="modal-save" class="btn primary">保存</button>
+  </div>
+</div>
+
+<script src="/static/app.js"></script>
+</body>
+</html>
