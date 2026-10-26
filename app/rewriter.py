@@ -16,7 +16,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import httpx
 
-from . import llm, sensitive, settings, style
+from . import llm, sensitive, settings, similarity, style
 from .config import CACHE_DIR
 from .db import get_conn, write_conn
 
@@ -111,7 +111,8 @@ def _save_result(payload: Dict[str, Any]) -> int:
             "INSERT INTO article_rewrites (article_id, cache_id, target_platform, content_form,"
             " variant_group, origin_title, origin_text, titles,"
             " used_title, draft_text, final_text, words, stage, status, attempts, error, provider,"
-            " model, elapsed, created_at, updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            " model, elapsed, dup_ratio, dup_detail, dup_rounds, dup_checked, created_at, updated_at)"
+            " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             [payload["article_id"], payload.get("cache_id"),
              payload.get("target_platform", ""), payload.get("content_form", "article"),
              payload.get("variant_group", ""),
@@ -120,7 +121,10 @@ def _save_result(payload: Dict[str, Any]) -> int:
              payload.get("draft_text", ""), payload.get("final_text", ""), payload.get("words", 0),
              payload.get("stage", ""), payload.get("status", "success"), payload.get("attempts", 0),
              (payload.get("error") or "")[:400], payload.get("provider", ""), payload.get("model", ""),
-             payload.get("elapsed", 0), now, now],
+             payload.get("elapsed", 0),
+             float(payload.get("dup_ratio") or 0), payload.get("dup_detail") or "[]",
+             int(payload.get("dup_rounds") or 0), int(payload.get("dup_checked") or 0),
+             now, now],
         )
         return int(cur.lastrowid or 0)
 
@@ -355,6 +359,10 @@ class RewriteEngine:
             "sensitive_hits": "[]",
             "sensitive_rounds": 0,
             "sensitive_checked_at": "",
+            "dup_ratio": 0.0,
+            "dup_detail": "[]",
+            "dup_rounds": 0,
+            "dup_checked": 0,
         }
         rewrite_id = _save_result(payload)
         _mark(article_id, "running", "", rewrite_id)
@@ -387,7 +395,12 @@ class RewriteEngine:
                       "（标题已在第 1 轮单独生成，正文需与标题描述一致，且不要再输出任何标题）")
         # 平台风格一定要追加：老库里用户保存过的提示词模板里没有 {{platform_style}}，
         # 只有追加这段，分平台风格与两版差异化要求才真正生效。
+        # 降重规则直接追加在提示词末尾：老库里用户保存的模板没有这条，
+        # 而平台查重（百家号「高度相似」限流）恰恰按连续相同片段判定。
         suffix += f"\n【目标平台】{pname}\n【平台风格】{brief}\n{style.diff_requirement()}"
+        suffix += ("\n【降重硬规则】不得与原文出现连续 10 个字以上相同的表述；"
+                   "判决书、通报、当事人原话必须转述（换主语、换句式、合并或拆分），禁止整段引用；"
+                   "段落顺序可按叙事逻辑重排，别保留原文的段落骨架。")
         if not need_title:
             suffix += "\n【形态】" + style.form_hint(platform, form)
         if avoid_text:
@@ -422,6 +435,10 @@ class RewriteEngine:
         else:
             payload["used_title"] = ""          # 微头条无标题
 
+        # ---- 降重：与原文连续相同的片段过多，平台会判「高度相似」限流 ----
+        final_text = await self._dedup_pass(cfg, src["text"], final_text, retries, payload)
+        payload["final_text"] = final_text
+
         # ---- 敏感词校验：命中就带着清单回炉，通过才允许进入排版/交付 ----
         title = str(payload.get("used_title") or "")
         ok, final_text, title, report = await self._sensitive_rounds(
@@ -442,7 +459,99 @@ class RewriteEngine:
         _update_result(rewrite_id, **{k: v for k, v in payload.items() if k != "article_id"})
         return {"ok": True, "rewrite_id": rewrite_id, "platform": platform, "form": form,
                 "title": title, "text": final_text,
+                "dup_ratio": payload.get("dup_ratio") or 0,
                 "sensitive_status": payload.get("sensitive_status") or ""}
+
+    async def _dedup_pass(self, cfg: Dict[str, Any], origin: str, text: str,
+                          retries: int, payload: Dict[str, Any],
+                          rounds: Optional[int] = None) -> str:
+        """与原文比字面重合率，超阈值就带着重复句清单回炉，直到降下来或轮数用尽。
+
+        平台（百家号 / 头条）判「与站内现有内容高度相似」看的是连续相同片段，
+        所以统计的也是连续重合字数占比，而不是语义相似度；不通过不阻断出稿，
+        只在记录里留痕，前端会显示「重合 X%，可能被判相似」。
+        """
+        if not settings.get_bool("rewrite.dedup_enabled", True):
+            payload.update({"dup_ratio": 0.0, "dup_detail": "[]", "dup_rounds": 0, "dup_checked": 0})
+            return text
+        limit = settings.get_float("rewrite.dedup_ratio", 0.20)
+        if rounds is None:
+            rounds = settings.get_int("rewrite.dedup_rounds", 2)
+        rounds = max(0, int(rounds))
+        min_run = settings.get_int("rewrite.dedup_minrun", similarity.DEFAULT_MIN_RUN)
+        base = settings.PROMPT_DEDUP_BASE
+        extra = (settings.get_setting("rewrite.prompt_dedup") or "").strip()
+        if extra == settings.PROMPT_DEDUP_V1:      # 老库遗留的初版模板，不算用户自定义
+            extra = ""
+
+        def _note(msg: str) -> None:
+            prev = str(payload.get("error") or "")
+            payload["error"] = (prev + "；" if prev else "") + msg
+
+        report = similarity.compare(origin, text, min_run)
+        best_text, best_report = text, report      # 模型偶尔越改越像，保留重合最低的那一版
+        used = 0
+        while report["ratio"] > limit and used < rounds:
+            frags = "\n".join(f"- {s}" for s in (report.get("fragments") or [])) \
+                or "-（正文中与原文重合的段落，逐段换一种说法）"
+            prompt = settings.render_template(base, text, fragments=frags, origin_text=origin)
+            if extra:
+                prompt += "\n\n【补充要求】\n" + extra
+            out, err, tries = await self._step(
+                cfg, prompt, retries, system=str(cfg.get("system_prompt") or ""))
+            payload["attempts"] += tries
+            used += 1
+            payload["dup_rounds"] = used
+            if err:
+                _note(f"降重第 {used} 轮失败：{err}")
+                break
+            cleaned = clean_output(out)
+            if not cleaned:
+                break
+            text = cleaned
+            report = similarity.compare(origin, text, min_run)
+            if report["ratio"] < best_report["ratio"]:
+                best_text, best_report = text, report
+
+        payload["dup_ratio"] = float(best_report.get("ratio") or 0)
+        payload["dup_detail"] = json.dumps(best_report.get("details") or [], ensure_ascii=False)
+        payload["dup_checked"] = 1
+        if best_report["ratio"] > limit and used >= rounds:
+            _note(f"降重 {used} 轮后与原文仍重合 {best_report['ratio'] * 100:.0f}%"
+                  f"（阈值 {limit * 100:.0f}%）")
+        return best_text
+
+    async def dedup_only(self, rewrite_id: int, rounds: Optional[int] = None) -> Dict[str, Any]:
+        """对已产出的稿件单独再跑降重，不重新改写正文。
+
+        模型改写波动大，一次不一定压到阈值以下；留一个可重复触发的手动入口，
+        每跑一次都与原文比一遍，只保留重合更低的那一版，并重跑交付。
+        """
+        d = detail(rewrite_id)
+        if not d:
+            return {"ok": False, "error": "改写记录不存在"}
+        origin = str(d.get("origin_text") or "")
+        text = str(d.get("final_text") or d.get("draft_text") or "")
+        if not origin or not text:
+            return {"ok": False, "error": "没有可比对的原文或成稿"}
+        cfg = llm.resolve("article")
+        if not cfg:
+            return {"ok": False, "error": "没有可用的文章模型，请先在「系统设置 → 大模型配置」里接入"}
+        started = time.time()
+        retries = max(0, settings.get_int("rewrite.max_retries", 2))
+        payload: Dict[str, Any] = {"attempts": 0, "error": "", "dup_ratio": 0.0,
+                                   "dup_detail": "[]", "dup_rounds": 0, "dup_checked": 0}
+        new_text = await self._dedup_pass(cfg, origin, text, retries, payload, rounds=rounds)
+        _update_result(
+            rewrite_id, final_text=new_text, words=len(re.sub(r"\s", "", new_text)),
+            dup_ratio=payload["dup_ratio"], dup_detail=payload["dup_detail"],
+            dup_rounds=payload["dup_rounds"], dup_checked=1,
+            error=(payload.get("error") or "")[:400],
+            elapsed=round(time.time() - started, 2),
+        )
+        if d.get("status") == "success" and d.get("article_id"):
+            await self._autofinish(int(d["article_id"]))
+        return {"ok": True, **(detail(rewrite_id) or {})}
 
     async def _sensitive_rounds(self, cfg: Dict[str, Any], platform: str, form: str,
                                 pname: str, article_id: int, rewrite_id: int, text: str,
@@ -723,6 +832,25 @@ def _present(row: Any) -> Dict[str, Any]:
     d["sensitive_status"] = str(d.get("sensitive_status") or "")
     d["sensitive_label"] = sensitive.status_label(d["sensitive_status"])
     d["sensitive_rounds"] = int(d.get("sensitive_rounds") or 0)
+    # 与原文的字面重合度：平台查重（百家号「高度相似」限流）按连续相同片段判定
+    d["dup_ratio"] = round(float(d.get("dup_ratio") or 0), 4)
+    d["dup_rounds"] = int(d.get("dup_rounds") or 0)
+    d["dup_checked"] = bool(int(d.get("dup_checked") or 0))
+    try:
+        d["dup_detail"] = json.loads(d.get("dup_detail") or "[]")
+    except (TypeError, ValueError):
+        d["dup_detail"] = []
+    d["dup_detail"] = d["dup_detail"] if isinstance(d["dup_detail"], list) else []
+    threshold = settings.get_float("rewrite.dedup_ratio", 0.20)
+    d["dup_threshold"] = round(threshold, 4)
+    if not d["dup_checked"]:
+        d["dup_level"] = ""                      # 老数据没测过
+    elif d["dup_ratio"] > threshold * 1.5:
+        d["dup_level"] = "bad"
+    elif d["dup_ratio"] > threshold:
+        d["dup_level"] = "warn"
+    else:
+        d["dup_level"] = "ok"
     # 老数据没有 content_form：按图文处理，前端不用再判空
     d["content_form"] = str(d.get("content_form") or "article")
     d["need_title"] = style.need_title(str(d.get("target_platform") or ""), d["content_form"])

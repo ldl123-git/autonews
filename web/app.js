@@ -1325,6 +1325,20 @@ function renderRewriteCompare(it) {
   const titles = it.titles || [];
   const hasPolish = it.final_text && it.final_text !== draft;
 
+  // 与原文的字面重合度：平台（尤其百家号）判「高度相似」按连续相同片段，不是语义相似
+  const dupChecked = !!it.dup_checked;
+  const dupRatio = Number(it.dup_ratio || 0);
+  const dupLimit = Number(it.dup_threshold || 0.20);
+  const dupLevel = it.dup_level || '';
+  const dupCls = dupLevel === 'bad' ? 'rd' : (dupLevel === 'warn' ? '' : 'gr');
+  const dupText = !dupChecked
+    ? '未检测'
+    : `${(dupRatio * 100).toFixed(0)}%${it.dup_rounds ? `（降重 ${it.dup_rounds} 轮）` : ''}`;
+  const dupPanel = (dupLevel === 'bad' || dupLevel === 'warn') ? `
+    <div class="drawer-note">与原文逐字重合 ${(dupRatio * 100).toFixed(0)}%，高于设定阈值
+      ${(dupLimit * 100).toFixed(0)}%：平台查重按连续相同片段判定，百家号这类稿子容易被判
+      「与站内现有内容高度相似」而限制推荐。建议重新改写换叙述角度，或手动改掉重复的句子。</div>` : '';
+
   const variants = rwState.variants || [];
   const vtab = variants.length > 1
     ? `<div class="ly-platform-bar"><div class="segmented inline">${variants.map((v) =>
@@ -1368,12 +1382,17 @@ function renderRewriteCompare(it) {
 
   // 改写失败 / 敏感词未过：给出「重新改写」与「人工放行」两条出路，
   // 放行会保留命中词留痕（交付目录 meta.json 里也能查到）。
-  const canAct = sensState === 'blocked' || it.status === 'failed';
+  const canAct = sensState === 'blocked' || it.status === 'failed'
+    || dupLevel === 'bad' || dupLevel === 'warn';
   const opsPanel = canAct ? `
     <div class="sens-ops">
       <button class="btn small" data-rw-act="retry" data-aid="${it.article_id}">重新改写</button>
       ${sensState === 'blocked'
         ? `<button class="btn small accent" data-rw-act="waive" data-rid="${it.id}">人工放行</button>`
+        : ''}
+      ${(dupLevel === 'bad' || dupLevel === 'warn') && it.status === 'success'
+        ? `<button class="btn small accent" data-rw-act="dedup" data-rid="${it.id}"
+            title="只重写与原文重复的段落，不动标题和事实；跑一次还会更接近就去点">再降重一次</button>`
         : ''}
       <button class="btn small ghost" data-rw-act="hits">复制命中词</button>
       <span class="muted">放行后仍会记下命中词，交付目录 meta.json 可追溯</span>
@@ -1387,10 +1406,12 @@ function renderRewriteCompare(it) {
       <div>敏感词<b class="${sensCls}">${escapeHtml(sensLabel)}${
         it.sensitive_rounds ? `（修复 ${it.sensitive_rounds} 轮）` : ''}</b></div>
       <div>字数<b>${it.words || 0}（原 ${Math.round((origin || '').replace(/\s/g, '').length)}）</b></div>
+      <div>原文重合<b class="${dupCls}">${dupText}</b></div>
       <div>耗时<b>${escapeHtml(String(it.elapsed || 0))}s · 模型调用 ${it.attempts || 0} 次</b></div>
     </div>
     ${vtab}
     ${opsPanel}
+    ${dupPanel}
     ${sensPanel}
 
     <div class="section-title">标题候选</div>
@@ -1525,6 +1546,28 @@ async function onRewriteDrawerClick(e) {
   if (act === 'hits') await copyRewritePart('hits');
   if (act === 'retry') await retryRewrite(e.target.dataset.aid);
   if (act === 'waive') await waiveRewrite(e.target.dataset.rid);
+  if (act === 'dedup') await dedupRewrite(e.target.dataset.rid);
+}
+
+async function dedupRewrite(rewriteId) {
+  const id = Number(rewriteId || 0);
+  if (!id) return;
+  const btn = document.querySelector(`[data-rw-act="dedup"][data-rid="${id}"]`);
+  if (btn) { btn.disabled = true; btn.textContent = '降重中…'; }
+  toast('正在与原文比对并重写重复段落，请稍候…');
+  try {
+    const item = await api(`/api/rewrite/${id}/dedup`, { method: 'POST' });
+    rwState.current = item;
+    const idx = (rwState.variants || []).findIndex((v) => String(v.id) === String(item.id));
+    if (idx >= 0) rwState.variants[idx] = item;
+    renderRewriteCompare(item);
+    const ratio = (Number(item.dup_ratio || 0) * 100).toFixed(0);
+    const ok = item.dup_level === 'ok';
+    toast(`降重完成：与原文重合 ${ratio}%${ok ? '' : '，仍偏高可以再点一次'}`, ok ? 'ok' : 'warn');
+  } finally {
+    if (btn && document.body.contains(btn)) { btn.disabled = false; btn.textContent = '再降重一次'; }
+  }
+  if (state.view === 'pipeline') refreshPipeline(); else refreshGroups();
 }
 
 /* ---------------- 文章排版 ---------------- */

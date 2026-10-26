@@ -164,6 +164,10 @@ CREATE TABLE IF NOT EXISTS article_rewrites (
     sensitive_checked_at TEXT DEFAULT '',
     sensitive_waived_at TEXT DEFAULT '',   -- 人工放行时间
     sensitive_waived_note TEXT DEFAULT '', -- 放行备注（谁批的、为什么）
+    dup_ratio REAL DEFAULT 0,          -- 与原文的字面重合率（0~1），平台查重口径
+    dup_detail TEXT DEFAULT '[]',      -- 重合句清单 JSON：[{text,share}]
+    dup_rounds INTEGER DEFAULT 0,      -- 实际跑了几轮降重重写
+    dup_checked INTEGER DEFAULT 0,     -- 是否做过重合度检测（老数据为 0）
     attempts INTEGER DEFAULT 0,
     error TEXT DEFAULT '',
     provider TEXT DEFAULT '',
@@ -405,7 +409,12 @@ def _ensure_columns(conn: sqlite3.Connection) -> None:
                      ("sensitive_rounds", "INTEGER DEFAULT 0"),
                      ("sensitive_checked_at", "TEXT DEFAULT ''"),
                      ("sensitive_waived_at", "TEXT DEFAULT ''"),
-                     ("sensitive_waived_note", "TEXT DEFAULT ''")):
+                     ("sensitive_waived_note", "TEXT DEFAULT ''"),
+                     # 与原文的字面重合度（平台查重口径）与降重重写轮次
+                     ("dup_ratio", "REAL DEFAULT 0"),
+                     ("dup_detail", "TEXT DEFAULT '[]'"),
+                     ("dup_rounds", "INTEGER DEFAULT 0"),
+                     ("dup_checked", "INTEGER DEFAULT 0")):
         if col not in rcols:
             conn.execute(f"ALTER TABLE article_rewrites ADD COLUMN {col} {ddl}")
     # 发布任务也记形态：微头条与图文走不同入口

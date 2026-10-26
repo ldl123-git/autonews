@@ -902,6 +902,15 @@ def get_latest_rewrite(article_id: int) -> Dict[str, Any]:
     return {"item": rewriter.latest(article_id)}
 
 
+@router.post("/rewrite/{rewrite_id}/dedup")
+async def dedup_rewrite(rewrite_id: int) -> Dict[str, Any]:
+    """对某个已产出的版本再跑降重：与原文比对，重写重复段落，不动事实。"""
+    res = await rewrite_engine.dedup_only(rewrite_id)
+    if not res.get("ok"):
+        raise HTTPException(400, res.get("error") or "降重失败")
+    return res
+
+
 @router.post("/rewrite/{article_id}/retry")
 def retry_rewrite(article_id: int) -> Dict[str, Any]:
     with get_conn() as conn:
