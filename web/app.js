@@ -180,17 +180,49 @@ async function loadDicts() {
   $('#cat-list').innerHTML = d.categories.map((c) => `<option value="${escapeHtml(c.name)}"></option>`).join('');
 }
 
-/* ---------------- 资讯列表（按日期归类） ---------------- */
+/* ---------------- 资讯列表（按日期归类 + 组内分页） ---------------- */
+const PAGE_SIZE = 8;   // 每个日期分组每页条数
+
+/** 组内翻页请求参数；date 为空表示「未标注日期」分组，必须显式只要这组。 */
+function pagerParams(date, page) {
+  const params = new URLSearchParams({
+    date: date || '', q: state.q, status: state.status,
+    category: state.category, sort: state.sort,
+    page: String(page), page_size: String(PAGE_SIZE),
+  });
+  if (!date) params.set('date_empty', '1');
+  return params.toString();
+}
+
 async function refreshGroups() {
-  const params = new URLSearchParams({ q: state.q, status: state.status, category: state.category, sort: state.sort, limit: 20 });
+  const params = new URLSearchParams({ q: state.q, status: state.status, category: state.category, sort: state.sort, limit: PAGE_SIZE });
   const data = await api('/api/articles/grouped?' + params.toString());
   const groupsEl = $('#groups');
   $('#empty').classList.toggle('hidden', data.groups.length > 0);
+  // 保留各组之前停留的页码（抓取/删除/自动刷新后不被打回第一页）
+  const prev = state.groupState;
+  const pageOf = (g) => {
+    const st = prev.get(g.date);
+    if (!st) return 1;
+    const pages = Math.max(1, Math.ceil((g.total || 0) / PAGE_SIZE));
+    return Math.min(Math.max(1, st.page || 1), pages);
+  };
+  const pages = data.groups.map(pageOf);
+  const extra = await Promise.all(data.groups.map((g, i) => (
+    pages[i] > 1
+      ? api('/api/articles?' + pagerParams(g.date, pages[i])).catch(() => null)
+      : null
+  )));
+  data.groups.forEach((g, i) => {
+    if (extra[i]) { g.items = extra[i].items; g.total = extra[i].total; }
+    g.page = pages[i];
+    g.page_size = PAGE_SIZE;
+  });
   groupsEl.innerHTML = data.groups.map((g, idx) => renderGroup(g, idx === 0)).join('');
   data.groups.forEach((g, idx) => {
     state.groupState.set(g.date, {
-      page: 1, total: g.total, items: g.items,
-      expanded: state.groupState.get(g.date)?.expanded ?? idx === 0,
+      page: g.page, total: g.total, items: g.items, page_size: PAGE_SIZE,
+      expanded: prev.get(g.date)?.expanded ?? idx === 0,
     });
     const el = groupsEl.querySelector(`.group[data-date="${g.date}"]`);
     if (el && !state.groupState.get(g.date).expanded) el.classList.add('collapsed');
@@ -213,14 +245,26 @@ function renderGroup(g, first) {
       <span class="group-actions">
         <button class="btn small" data-act="fetch-date">抓取本日原文</button>
         <button class="btn small" data-act="media-date">抓取本日素材</button>
-        <button class="btn small ghost" data-act="expand-all">${g.total > g.items.length ? `展开全部 ${g.total} 条` : '已全部显示'}</button>
         <button class="btn small ghost" data-act="del-date">删除本日</button>
       </span>
     </div>
     <div class="group-body">
       ${renderTable(g.items)}
-      ${g.has_more ? `<div class="more"><button class="btn ghost" data-act="more">加载更多（剩余 ${g.total - g.items.length} 条）</button></div>` : ''}
+      ${renderPager(g)}
     </div>
+  </div>`;
+}
+
+function renderPager(g) {
+  const total = Number(g.total) || 0;
+  const size = Number(g.page_size) || PAGE_SIZE;
+  const page = Math.min(Math.max(1, Number(g.page) || 1), Math.max(1, Math.ceil(total / size)));
+  const pages = Math.max(1, Math.ceil(total / size));
+  if (pages <= 1) return total ? '<div class="pager"><span class="pager-info">共 ' + total + ' 条</span></div>' : '';
+  return `<div class="pager">
+    <button class="btn small ghost" data-act="page-prev" ${page <= 1 ? 'disabled' : ''}>上一页</button>
+    <span class="pager-info">第 ${page} / ${pages} 页 · 共 ${total} 条</span>
+    <button class="btn small ghost" data-act="page-next" ${page >= pages ? 'disabled' : ''}>下一页</button>
   </div>`;
 }
 
@@ -236,7 +280,12 @@ function renderTable(items) {
 }
 
 const MEDIA_TEXT = { pending: '素材', queued: '收集中…', running: '收集中…', success: '',
-                     failed: '素材失败', empty: '无素材' };
+                    failed: '素材失败', empty: '无素材' };
+// 素材已采过（成功/无素材）之后的「重采」入口：清空旧素材，按标题/关键词重新检索
+const MEDIA_RETRY_BTN = '<button class="btn small ghost" data-act="media-retry"'
+  + ' title="清空现有素材，按标题/关键词重新检索（不满意时用这个）">重采</button>';
+// 已经采过（成功 / 无素材 / 失败）的状态：点主按钮进抽屉查看、上传、换词重采
+const MEDIA_DONE_STATES = ['success', 'empty', 'failed'];
 function mediaLabel(r) {
   const st = r.media_status || 'pending';
   if (st === 'success') return `素材${r.media_count ? `(${r.media_count})` : ''}`;
@@ -274,6 +323,7 @@ function rowHtml(r) {
         <button class="btn small ghost" data-act="rw-view" ${r.rewrite_id ? '' : 'hidden'}>对比</button>
         <button class="btn small ${r.media_status === 'success' ? 'accent' : 'ghost'}" data-act="media"
           ${r.content_id ? '' : 'disabled'}>${mediaLabel(r)}</button>
+        ${MEDIA_DONE_STATES.includes(r.media_status || '') ? MEDIA_RETRY_BTN : ''}
         <button class="btn small ${r.rewrite_id ? '' : 'ghost'}" data-act="layout"
           ${r.rewrite_id ? '' : 'disabled'}>排版</button>
         <a class="btn small ghost" href="${escapeHtml(safeUrl(r.url))}" target="_blank" rel="noreferrer">链接</a>
@@ -403,6 +453,7 @@ function initEvents() {
   on('#drawer-body', 'click', safe(onRewriteDrawerClick));
   on('#drawer-body', 'click', safe(onLayoutDrawerClick));
   on('#drawer-body', 'change', safe(onLayoutDrawerChange));
+  on('#drawer-body', 'change', safe(onMediaUploadChange));
   on('#drawer-close', 'click', closeDrawer);
   on('#drawer-mask', 'click', closeDrawer);
 
@@ -555,32 +606,22 @@ async function onGroupClick(e) {
     refreshStats();
     return;
   }
-  if (act === 'more') {
-    const st = state.groupState.get(date) || { page: 1, items: [] };
-    st.page += 1;
-    const params = new URLSearchParams({ date, q: state.q, status: state.status, category: state.category, sort: state.sort, page: st.page, page_size: 50 });
-    const data = await api('/api/articles?' + params.toString());
-    const body = group.querySelector('.group-body');
-    const tbody = body.querySelector('tbody');
-    tbody.insertAdjacentHTML('beforeend', data.items.map((r) => renderRow(r)).join(''));
-    st.items = st.items.concat(data.items);
-    state.groupState.set(date, st);
-    const more = body.querySelector('.more');
-    if (more) {
-      if (st.items.length >= st.total) more.remove();
-      else more.querySelector('button').textContent = `加载更多（剩余 ${st.total - st.items.length} 条）`;
-    }
-    startPolling();
-    return;
-  }
-  if (act === 'expand-all') {
-    if (group.classList.contains('collapsed')) group.classList.remove('collapsed');
+  if (act === 'page-prev' || act === 'page-next') {
     const st = state.groupState.get(date);
-    if (!st || st.items.length >= st.total) return;
-    const params = new URLSearchParams({ date, q: state.q, status: state.status, category: state.category, sort: state.sort, page: 1, page_size: st.total });
-    const data = await api('/api/articles?' + params.toString());
-    group.querySelector('.group-body').innerHTML = renderTable(data.items);
-    state.groupState.set(date, { page: 1, items: data.items, total: st.total, expanded: true });
+    if (!st) return;
+    const pages = Math.max(1, Math.ceil((st.total || 0) / PAGE_SIZE));
+    const page = Math.min(pages, Math.max(1, (st.page || 1) + (act === 'page-next' ? 1 : -1)));
+    if (page === st.page) return;
+    const data = await api('/api/articles?' + pagerParams(date, page));
+    st.page = page;
+    st.items = data.items;
+    st.total = data.total;
+    st.page_size = PAGE_SIZE;
+    state.groupState.set(date, st);
+    if (group.classList.contains('collapsed')) group.classList.remove('collapsed');
+    const body = group.querySelector('.group-body');
+    if (body) body.innerHTML = renderTable(st.items) + renderPager(st);
+    startPolling();
     return;
   }
 
@@ -608,7 +649,8 @@ async function onGroupClick(e) {
     toast(`已导出到 output/${res.dir}`, 'ok');
     refreshStats();
   } else if (act === 'media') {
-    if (tr.dataset.mst === 'success') { await openMedia(id); return; }
+    // 采过（成功 / 无素材 / 失败）就进抽屉：查看、上传本地素材、换词重采都在里面
+    if (MEDIA_DONE_STATES.includes(tr.dataset.mst || '')) { await openMedia(id); return; }
     const res = await api('/api/media/collect', {
       method: 'POST',
       body: JSON.stringify({ ids: [id], image_count: state.imageCount, video_count: state.videoCount }),
@@ -620,6 +662,22 @@ async function onGroupClick(e) {
     mediaAutoOpen.add(id);
     startMediaPolling([id]);
     toast('已加入素材队列，收集完成后自动打开', 'ok');
+  } else if (act === 'media-retry') {
+    if (!confirm('重新采集会清空这篇现有的素材，再按标题/关键词重新检索；' +
+      '已交付的成稿会用新素材重建。继续？')) return;
+    const res = await api('/api/media/collect', {
+      method: 'POST',
+      body: JSON.stringify({ ids: [id], image_count: state.imageCount, video_count: state.videoCount }),
+    });
+    if (!res.enqueued) { toast('该记录无法收集素材，请先抓取原文', 'warn'); return; }
+    tr.dataset.mst = 'queued';
+    const mbtn = tr.querySelector('[data-act=media]');
+    if (mbtn) { mbtn.textContent = '收集中…'; mbtn.className = 'btn small ghost'; }
+    const rbtn = tr.querySelector('[data-act=media-retry]');
+    if (rbtn) rbtn.remove();
+    mediaAutoOpen.add(id);
+    startMediaPolling([id]);
+    toast('已重新加入素材队列，完成后自动打开结果', 'ok');
   } else if (act === 'rewrite') {
     await startRewrite([id], tr);
   } else if (act === 'rw-view') {
@@ -633,9 +691,15 @@ async function onGroupClick(e) {
     tr.remove();
     if (group) {
       const st = state.groupState.get(group.dataset.date);
-      if (st) { st.total -= 1; st.items = st.items.filter((it) => it.id !== id); }
+      if (st) { st.total = Math.max(0, st.total - 1); st.items = st.items.filter((it) => it.id !== id); }
       const meta = group.querySelectorAll('.group-meta span');
       if (meta[0]) meta[0].textContent = `共 ${Math.max(0, (st ? st.total : 0))} 条`;
+      const body = group.querySelector('.group-body');
+      if (st && body) {
+        body.innerHTML = renderTable(st.items) + renderPager(st);
+        // 删掉最后一页最后一条时回退到上一页，避免停在空页
+        if (!st.items.length && st.page > 1) { await refreshGroups(); return; }
+      }
       if (!group.querySelector('tr[data-id]') && !(st && st.items.length)) group.remove();
     }
     refreshStats();
@@ -835,11 +899,21 @@ async function pollMedia() {
           cell.insertAdjacentHTML('beforeend', `<div class="row-msg">${escapeHtml(it.media_error)}</div>`);
         }
       }
+      // 采完/清空后把「重采」入口补回来，不用刷新页面
+      const ops = tr.querySelector('.ops');
+      if (ops && MEDIA_DONE_STATES.includes(it.media_status)
+        && !ops.querySelector('[data-act=media-retry]')) {
+        const mbtn = ops.querySelector('[data-act=media]');
+        if (mbtn) mbtn.insertAdjacentHTML('afterend', MEDIA_RETRY_BTN);
+      }
     }
     if (['success', 'failed', 'empty'].includes(it.media_status)) {
       mediaPolling.delete(id);
       if (mediaAutoOpen.has(id) && it.media_status === 'success') {
         mediaAutoOpen.delete(id);
+        openMedia(id);
+      } else if (isMediaDrawerOpen(id)) {
+        // 在素材抽屉里点「重新收集 / 换关键词重采」，采完直接刷新抽屉
         openMedia(id);
       }
       mediaAutoOpen.delete(id);
@@ -848,6 +922,15 @@ async function pollMedia() {
 }
 
 /* ---------------- 素材抽屉 ---------------- */
+function isMediaDrawerOpen(articleId) {
+  const drawer = $('#drawer');
+  if (!drawer || drawer.classList.contains('hidden')) return false;
+  const title = $('#drawer-title');
+  const body = $('#drawer-body');
+  return !!title && title.textContent === '素材收集结果'
+    && Number((body && body.dataset.article) || 0) === Number(articleId);
+}
+
 async function openMedia(articleId) {
   const d = await api(`/api/media/${articleId}`);
   const images = d.items.filter((x) => x.kind === 'image');
@@ -876,20 +959,26 @@ async function openMedia(articleId) {
     </div>
     ${d.media_error ? `<div class="drawer-note">${escapeHtml(d.media_error)}</div>` : ''}
     <div class="drawer-actions">
-      <button class="btn small primary" data-mact="collect">重新收集</button>
+      <button class="btn small primary" data-mact="upload"
+        title="自动采的都不合用时，直接从电脑选图 / 选视频补进来">上传本地素材</button>
+      <input type="file" id="media-upload-input" class="hidden" multiple accept="image/*,video/*" />
+      <button class="btn small" data-mact="collect">重新收集</button>
+      <button class="btn small accent" data-mact="kw-collect"
+        title="换一批检索词重搜，适合当前素材和文章对不上时">换关键词重采</button>
       <button class="btn small ghost" data-mact="clear">清空素材</button>
       <button class="btn small ghost" data-mact="refresh">刷新</button>
     </div>
     <div class="section-title">图片素材（${images.length}）</div>
     ${images.length ? `<div class="media-grid">${images.map(mediaCard).join('')}</div>`
-      : '<div class="empty">暂无图片素材</div>'}
+      : '<div class="empty">暂无图片素材，可点上方「上传本地素材」自己补</div>'}
     <div class="section-title">视频素材（${videos.length}）</div>
-    ${videos.length ? videos.map(videoCard).join('') : '<div class="empty">暂无视频素材</div>'}
+    ${videos.length ? videos.map(videoCard).join('') : '<div class="empty">暂无视频素材，可点上方「上传本地素材」自己补</div>'}
     ${frames.length ? `<div class="section-title">视频抽帧（${frames.length}）</div>
       <div class="drawer-note">抽帧会并入排版图片池，与正式图片一起按相关度排序；自动排版至少留 1 张名额给抽帧，同一视频最多取 2 张（都可在系统设置里改），排版页也能手动插入。</div>
       <div class="media-grid">${frames.map(mediaCard).join('')}</div>` : ''}
   `;
   $('#drawer-body').dataset.article = articleId;
+  $('#drawer-body').dataset.keywords = JSON.stringify(d.keywords || []);
   openDrawer();
 }
 
@@ -898,7 +987,7 @@ function matchTag(m) {
   if (!v) return '';
   return ` <span class="tag ${v >= 0.3 ? 'success' : v >= 0.12 ? 'fetching' : 'failed'}">相关度 ${Math.round(v * 100)}%</span>`;
 }
-const PROVIDER_TEXT = { origin: '原文配图', news: '同源报道', baidu: '百度图片', bing: 'Bing 图片', pexels: 'Pexels', unsplash: 'Unsplash', bilibili: '哔哩哔哩' };
+const PROVIDER_TEXT = { origin: '原文配图', news: '同源报道', baidu: '百度图片', bing: 'Bing 图片', pexels: 'Pexels', unsplash: 'Unsplash', bilibili: '哔哩哔哩', upload: '本地上传' };
 // 被裁掉的边缘文字条（水印 / 台标 / 字幕），见 app/media/process.py::strip_text_bands
 const BAND_TEXT = { top: '顶部', bottom: '底部', left: '左侧', right: '右侧' };
 function bandTag(m) {
@@ -937,9 +1026,30 @@ async function onMediaDrawerClick(e) {
   const articleId = Number($('#drawer-body').dataset.article || 0);
   if (!articleId) return;
   if (act === 'refresh') { await openMedia(articleId); return; }
+  if (act === 'upload') {
+    const input = $('#media-upload-input');
+    if (input) input.click();
+    return;
+  }
   if (act === 'collect') {
     await api('/api/media/collect', { method: 'POST', body: JSON.stringify({ ids: [articleId] }) });
     toast('已重新加入素材队列', 'ok');
+    startMediaPolling([articleId]);
+    return;
+  }
+  if (act === 'kw-collect') {
+    let cur = [];
+    try { cur = JSON.parse($('#drawer-body').dataset.keywords || '[]') || []; } catch (e) { cur = []; }
+    const input = prompt(
+      '输入检索关键词（逗号分隔，会替代自动提取的关键词层，标题检索不变）\n留空＝恢复自动提取',
+      cur.join('，'));
+    if (input === null) return;
+    const keywords = input.split(/[,，、\s]+/).map((s) => s.trim()).filter(Boolean);
+    await api('/api/media/collect', {
+      method: 'POST',
+      body: JSON.stringify({ ids: [articleId], keywords }),
+    });
+    toast(keywords.length ? '已按新关键词重新采集' : '已恢复自动关键词并重新采集', 'ok');
     startMediaPolling([articleId]);
     return;
   }
@@ -958,6 +1068,35 @@ async function onMediaDrawerClick(e) {
     await openMedia(articleId);
     await Promise.all([refreshStats(), refreshGroups()]);
   }
+}
+
+/* ---------------- 本地上传素材 ---------------- */
+async function onMediaUploadChange(e) {
+  const input = e.target;
+  if (!input || input.id !== 'media-upload-input' || !input.files || !input.files.length) return;
+  const articleId = Number($('#drawer-body').dataset.article || 0);
+  const files = Array.from(input.files);
+  input.value = '';
+  if (!articleId) return;
+  const form = new FormData();
+  files.forEach((f) => form.append('files', f));
+  toast(`正在上传 ${files.length} 个素材…`);
+  let data;
+  try {
+    const res = await fetch(`/api/media/${articleId}/upload`, { method: 'POST', body: form });
+    data = await res.json();
+    if (!res.ok) { toast('上传失败：' + (data.detail || res.status), 'warn'); return; }
+  } catch (err) {
+    toast('上传失败：' + (err.message || err), 'warn');
+    return;
+  }
+  const skipped = data.skipped || [];
+  const skipMsg = skipped.length
+    ? `；跳过 ${skipped.length} 个（${skipped.map((s) => `${s.filename}：${s.reason}`).join('，')}）`
+    : '';
+  toast(`已添加 ${data.added} 个素材${skipMsg}`, data.added ? 'ok' : 'warn');
+  await openMedia(articleId);
+  await Promise.all([refreshGroups(), refreshStats()]);
 }
 
 /* ---------------- 缓存区 ---------------- */

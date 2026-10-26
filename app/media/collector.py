@@ -540,11 +540,51 @@ def delete_asset(article_id: int, asset_id: int) -> bool:
         except OSError:
             pass
         conn.execute("DELETE FROM media_assets WHERE id=?", (asset_id,))
-        left = conn.execute(
-            "SELECT COUNT(*) c FROM media_assets WHERE article_id=?", (article_id,)
-        ).fetchone()["c"]
-        conn.execute("UPDATE articles SET media_count=? WHERE id=?", (left, article_id))
+    # 删完最后一张时状态回落成「无素材」，行内按钮与重采入口才不会自相矛盾
+    refresh_media_state(article_id)
     return True
+
+
+def add_local_asset(article_id: int, kind: str, path: Path, name: str = "",
+                    width: int = 0, height: int = 0) -> Dict[str, Any]:
+    """登记一个手工上传的素材（文件已由调用方落盘）。
+
+    自动检索不可能次次都对题，留一个「自己传」的兜底入口：
+    上传的素材直接算 ready、相关度给满分，并并入图片/视频池供排版取用。
+    """
+    rel = _rel(path)
+    rec = {
+        "name": name or path.name,
+        "url": "/output/" + rel,
+        "path": str(path),
+        "source_url": "", "page_url": "",
+        "platform": "本地上传", "provider": "upload",
+        "keyword": "手动上传",
+        "width": int(width or 0), "height": int(height or 0),
+        "bytes": path.stat().st_size if path.exists() else 0,
+        "match": 1.0,
+    }
+    _insert_asset(article_id, kind, rec, "ready")
+    with get_conn() as conn:
+        row = conn.execute(
+            "SELECT id FROM media_assets WHERE article_id=? ORDER BY id DESC LIMIT 1",
+            (article_id,)).fetchone()
+    total = refresh_media_state(article_id)
+    return {"id": int(row["id"]) if row else 0, "total": total, "url": rec["url"]}
+
+
+def refresh_media_state(article_id: int) -> int:
+    """按 media_assets 实有数量回写 articles 的素材状态（上传 / 删除单条后调用）。"""
+    with write_conn() as conn:
+        n = int(conn.execute(
+            "SELECT COUNT(*) c FROM media_assets WHERE article_id=?", (article_id,)
+        ).fetchone()["c"])
+        conn.execute(
+            """UPDATE articles SET media_status=?, media_error='', media_count=?,
+               media_at=?, updated_at=? WHERE id=?""",
+            ("success" if n else "empty", n, _now(), _now(), article_id),
+        )
+    return n
 
 
 def list_assets(article_id: int) -> List[Dict[str, Any]]:

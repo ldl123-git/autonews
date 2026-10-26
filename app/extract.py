@@ -6,7 +6,13 @@ from typing import Dict, List, Optional
 from .config import CLEAN_TEXT, COLLECT_MEDIA
 
 SKIP_TAGS = {"script", "style", "noscript", "svg", "template", "form", "nav", "footer", "header", "aside"}
-CONTAINER_TAGS = {"div", "section", "article", "main", "td", "body"}
+CONTAINER_TAGS = {"div", "section", "article", "main", "td", "body", "blockquote"}
+# 正文里能独立成段的标签：头条等站点常把段落塞进 blockquote / 小标题里
+PARA_TAGS = {"p", "h1", "h2", "h3", "h4", "h5", "h6", "li"}
+# 自闭合元素：它们不会有 endtag，绝不能入栈，否则后面的节点全成了它们的子节点，
+# 段落既进不了父容器（div 的 paras 收不到），也会让正文聚合错乱。
+VOID_TAGS = {"area", "base", "br", "col", "embed", "hr", "img", "input", "link",
+             "meta", "param", "source", "track", "wbr"}
 BLOCK_TAGS = {"p", "br", "li", "h1", "h2", "h3", "h4", "h5", "h6", "tr", "blockquote", "pre"}
 IMG_ATTRS = ("src", "data-src", "data-original", "data-lazy-src", "data-actualsrc", "data-url", "data-image")
 IMG_BLACKLIST = ("logo", "icon", "sprite", "avatar_default", "placeholder", "loading", "bg_", "qrcode")
@@ -110,14 +116,8 @@ class _PageParser(HTMLParser):
     def _skipping(self) -> bool:
         return any(node["tag"] in SKIP_TAGS for node in self.stack)
 
-    # ---- handlers ----
-    def handle_starttag(self, tag, attrs):
-        tag = tag.lower()
-        self.stack.append({"tag": tag, "attrs": attrs, "texts": [], "paras": [],
-                           "cls": self._attr(attrs, "class")})
-        if tag == "title":
-            self._in_title = True
-            return
+    def _handle_void(self, tag: str, attrs) -> None:
+        """自闭合标签：只处理属性，不参与节点栈。"""
         if tag == "meta":
             key = self._attr(attrs, "property") or self._attr(attrs, "name")
             if key:
@@ -132,7 +132,25 @@ class _PageParser(HTMLParser):
                         self.images.append(src)
                     break
             return
-        if tag in ("video", "source", "embed"):
+        if tag in ("source", "embed"):
+            src = self._attr(attrs, "src")
+            if src and self._valid_video(src):
+                self.video_count += 1
+                if self.collect_media:
+                    self.videos.append(src)
+
+    # ---- handlers ----
+    def handle_starttag(self, tag, attrs):
+        tag = tag.lower()
+        if tag in VOID_TAGS:
+            self._handle_void(tag, attrs)
+            return
+        self.stack.append({"tag": tag, "attrs": attrs, "texts": [], "paras": [],
+                           "cls": self._attr(attrs, "class")})
+        if tag == "title":
+            self._in_title = True
+            return
+        if tag in ("video",):
             src = self._attr(attrs, "src")
             if src and self._valid_video(src):
                 self.video_count += 1
@@ -186,7 +204,7 @@ class _PageParser(HTMLParser):
             if text and self.stack:
                 parent = self.stack[-1]
                 parent_is_container = parent["tag"] in CONTAINER_TAGS
-                is_para = node["tag"] == "p" or (node["tag"] == "span" and len(text) >= PARA_MIN)
+                is_para = node["tag"] in PARA_TAGS or (node["tag"] == "span" and len(text) >= PARA_MIN)
                 if is_para and parent_is_container:
                     parent["paras"].append(text)
                 parent["texts"].append(text)

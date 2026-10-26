@@ -18,8 +18,8 @@ from .publish import jobs as publish_jobs
 from .config import CACHE_DIR, MEDIA_ENABLED, OUTPUT_DIR, UPLOAD_DIR
 from .db import get_conn, write_conn
 from .fetcher import engine
-from .media.collector import (clear_assets, delete_asset, engine as media_engine,
-                              list_assets)
+from .media.collector import (IMG_DIRNAME, VID_DIRNAME, add_local_asset, clear_assets,
+                              delete_asset, engine as media_engine, list_assets)
 from .rewriter import engine as rewrite_engine
 
 router = APIRouter()
@@ -39,7 +39,7 @@ def _now() -> str:
 
 # ---------------------------------------------------------------- 筛选条件
 def _build_where(q: str, status: str, category: str, source: str, date: str = "",
-                 content_type: str = "") -> (str, List[Any]):
+                 content_type: str = "", date_empty: int = 0) -> (str, List[Any]):
     clauses: List[str] = []
     args: List[Any] = []
     if q:
@@ -59,6 +59,9 @@ def _build_where(q: str, status: str, category: str, source: str, date: str = ""
     if date:
         clauses.append("publish_date = ?")
         args.append(date)
+    elif date_empty:
+        # 「未标注日期」分组：表格里没填发布时间，翻页时不能退回查全表
+        clauses.append("(publish_date = '' OR publish_date IS NULL)")
     if content_type:
         clauses.append("content_type = ?")
         args.append(content_type)
@@ -145,9 +148,9 @@ def delete_batch(batch_id: int) -> Dict[str, Any]:
 @router.get("/articles")
 def list_articles(date: str = "", status: str = "", q: str = "", category: str = "",
                   source: str = "", content_type: str = "", sort: str = "default",
-                  page: int = 1, page_size: int = 50) -> Dict[str, Any]:
-    where, args = _build_where(q, status, category, source, date, content_type)
-    offset = max(page - 1, 0) * page_size
+                  page: int = 1, page_size: int = 50, date_empty: int = 0) -> Dict[str, Any]:
+    where, args = _build_where(q, status, category, source, date, content_type, date_empty)
+    offset = max(page - 1, 0) * max(1, page_size)
     with get_conn() as conn:
         total = conn.execute(f"SELECT COUNT(*) c FROM articles{where}", args).fetchone()["c"]
         rows = conn.execute(
@@ -666,6 +669,90 @@ def get_media(article_id: int) -> Dict[str, Any]:
 @router.delete("/media/{article_id}")
 def delete_media(article_id: int) -> Dict[str, Any]:
     return {"deleted": clear_assets(article_id)}
+
+
+# 手工上传素材：自动检索总有几次「全都不对题」，得能自己传图 / 传片补进来
+_UP_IMG_EXTS = {".jpg", ".jpeg", ".png", ".webp", ".gif", ".bmp", ".avif"}
+_UP_VID_EXTS = {".mp4", ".mov", ".webm", ".m4v", ".mkv"}
+_UP_IMG_MAX = 30 * 1024 * 1024
+_UP_VID_MAX = 500 * 1024 * 1024
+
+
+def _unique_upload_path(dir_path: Path, stem: str, suffix: str) -> Path:
+    idx = 1
+    while True:
+        path = dir_path / f"{stem}-{idx:02d}{suffix}"
+        if not path.exists():
+            return path
+        idx += 1
+
+
+def _image_size(path: Path) -> tuple:
+    try:
+        from PIL import Image
+
+        with Image.open(path) as im:
+            return int(im.width), int(im.height)
+    except Exception:  # noqa: BLE001 - 读不出尺寸不影响素材可用
+        return 0, 0
+
+
+@router.post("/media/{article_id}/upload")
+async def upload_media(article_id: int, background: BackgroundTasks,
+                       files: List[UploadFile] = File(...)) -> Dict[str, Any]:
+    """上传本地素材（图片 / 视频），直接并入该文章的素材池。"""
+    if not files:
+        raise HTTPException(400, "未选择文件")
+    with get_conn() as conn:
+        row = conn.execute("SELECT * FROM articles WHERE id=?", (article_id,)).fetchone()
+    if not row:
+        raise HTTPException(404, "记录不存在")
+    directory = exporter.article_dir(dict(row))
+    img_dir, vid_dir = directory / IMG_DIRNAME, directory / VID_DIRNAME
+
+    added, skipped = 0, []
+    for file in files:
+        name = file.filename or "upload"
+        suffix = Path(name).suffix.lower()
+        if suffix in _UP_IMG_EXTS:
+            kind, target_dir, limit = "image", img_dir, _UP_IMG_MAX
+        elif suffix in _UP_VID_EXTS:
+            kind, target_dir, limit = "video", vid_dir, _UP_VID_MAX
+        else:
+            skipped.append({"filename": name, "reason": "仅支持图片 / 视频文件"})
+            await file.close()
+            continue
+        target_dir.mkdir(parents=True, exist_ok=True)
+        target = _unique_upload_path(target_dir, "手动", suffix)
+        size = 0
+        async with aiofiles.open(target, "wb") as out:
+            while True:
+                chunk = await file.read(1024 * 1024)
+                if not chunk:
+                    break
+                size += len(chunk)
+                if size > limit:
+                    break
+                await out.write(chunk)
+        await file.close()
+        if size == 0 or size > limit:
+            target.unlink(missing_ok=True)
+            skipped.append({"filename": name, "reason": "文件为空或超过大小上限"})
+            continue
+        width, height = _image_size(target) if kind == "image" else (0, 0)
+        add_local_asset(article_id, kind, target, name=name, width=width, height=height)
+        added += 1
+
+    if added:
+        # 已有合格改写稿时重跑交付，让刚传的素材直接补进成稿（与自动采集一致）
+        with get_conn() as conn:
+            has_rewrite = conn.execute(
+                "SELECT 1 FROM article_rewrites WHERE article_id=? AND status='success' LIMIT 1",
+                (article_id,)).fetchone()
+        if has_rewrite:
+            background.add_task(finish.export_article, article_id)
+    return {"ok": added > 0, "added": added, "skipped": skipped,
+            "items": list_assets(article_id)}
 
 
 @router.delete("/media/{article_id}/assets/{asset_id}")

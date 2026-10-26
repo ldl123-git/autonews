@@ -2,15 +2,17 @@
 import asyncio
 import datetime as dt
 import json
+import logging
 import re
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import aiofiles
 import httpx
 
 from . import extract
 from . import exporter
+from . import toutiao
 from .config import (
     AUTO_EXPORT,
     CACHE_DIR,
@@ -24,6 +26,8 @@ from .config import (
 from .db import get_conn, write_conn
 
 SAVE_HTML = False  # 是否同时保存原始 HTML（默认关闭，避免磁盘膨胀）
+
+log = logging.getLogger(__name__)
 
 
 def _now() -> str:
@@ -103,6 +107,12 @@ class FetchEngine:
             )
 
         last_error = ""
+        # 头条网页只剩反爬 JS 壳（_$jsvmprt），正文只存在于移动端 info 接口里，
+        # 所以先走结构化接口，拿不到再回退下面的 HTML 解析。
+        if toutiao.is_toutiao(url):
+            ok, last_error = await self._fetch_toutiao(client, article, url)
+            if ok:
+                return
         for attempt in range(self.retry + 1):
             try:
                 req_headers = {"User-Agent": MOBILE_UA if attempt else USER_AGENT,
@@ -122,6 +132,11 @@ class FetchEngine:
                     html = raw.decode(enc, errors="replace")
                 except LookupError:
                     html = raw.decode("utf-8", errors="replace")
+                if toutiao.is_toutiao(url) and "_$jsvmprt" in html:
+                    # 反爬壳页只有 <title>/<meta> 和一段 JS，正文解析出来是空的；
+                    # 别把壳页里的标题残渣当成成功正文写进缓存。
+                    last_error = "头条页面被反爬脚本拦截"
+                    continue
                 data = extract.parse_page(html, url, collect_media=COLLECT_MEDIA)
                 text = data["text"]
                 if len(re.sub(r"\s+", "", text)) < 30:
@@ -140,6 +155,28 @@ class FetchEngine:
             except Exception as exc:  # noqa: BLE001
                 last_error = f"解析失败：{exc}"
         self._mark_failed(article_id, last_error or "抓取失败")
+
+    async def _fetch_toutiao(self, client: httpx.AsyncClient, article: Dict,
+                             url: str) -> Tuple[bool, str]:
+        """走头条 info 接口抓取；成功返回 (True, "")，失败返回原因交给 HTML 回退。"""
+        gid = await toutiao.resolve_gid(client, url)
+        if not gid:
+            log.warning("头条链接未识别出内容 ID：%s", url)
+            return False, "未识别头条内容 ID"
+        detail = await toutiao.fetch_detail(client, gid)
+        if not detail:
+            return False, "头条接口不可用"
+        data = toutiao.to_page_data(detail, url, collect_media=COLLECT_MEDIA)
+        if not data:
+            return False, "头条接口未取到有效正文"
+        content_type = extract.classify(
+            article["content_type"] or "", data["text"],
+            data.get("img_count", 0), data.get("video_count", 0), data["meta"],
+        )
+        await self._save(article, data, content_type, url, 0, "")
+        log.info("头条抓取成功 id=%s gid=%s 形态=%s 正文 %s 字",
+                 article["id"], gid, content_type, len(data.get("text") or ""))
+        return True, ""
 
     # ---------------- persistence ----------------
     @staticmethod
